@@ -1,0 +1,146 @@
+基于freeswitch+linphone客户端开发对讲系统
+
+基本思路:
+
+freeswitch开启conference call (3100), 并进行一些配置(例如，没有moh，刚刚进入时静音禁止视频等)，linphone客户端界面改造：启动后自动拨号3100进入fs会议，当按下客户端的‘对讲’按钮后，客户端通过dtmf info发送命令给fs, fs收到dtmf命令后会激发相应的dtmf事件，一个专门的esl客户端监听此类事件，解析这个dtmf事件来获得收到的键值，得知客户端想要对讲，则调用fs的会议控制命令来打开这个会议成员的讲话权限，客户端的声音就可以传入会议中，会议里的所有与会者(客户端)都通过这样的逻辑来控制和协调，保证每次只能有一个客户端讲话(非混音模式)，在一个客户端讲话期间，前10秒内其他客户端不能抢，超过10秒，其他客户端可以抢过话权即打断正在讲话的客户端，以及与会者的在线状态广播
+
+功能特点:
+
+集群对讲
+点对点对讲
+支持普通耳机、蓝牙耳机、外放、ptt切换
+10秒超时抢话
+多群组，每个群组之间不通话
+领导模式：设定为领导，可以对多个群组进行广播
+用户在线列表管理
+...
+1
+2
+3
+4
+5
+6
+7
+8
+1.linphone客户端改造:
+
+采用linphone-android ver3.9.1，主要改动包括:
+去掉linphone原有的联系人好友关联功能(会影响到相关activity的自动化转换)
+好友在线状态订阅功能去掉--当时在客户端在线状态管理上纠结了一番，采用linphone的presence publish&subscribe还是通过服务器检测和广播呢？后来决定采用服务器广播的方式--是因为3.9.1版本的linphone对于presence publish & subscribe功能支持有bug--当然如果客户端数量达到百级别的话，无论如何都应该上presence机制了，我们的客户端一般不超过几十个
+去掉多余的video/audio codecs选项，主要是简化sdp,减少sip流量及出错几率(当sdp超过mtu时，面临分包，可能会导致潜在的问题)
+多账号登录问题，断线提示，状态刷新，mediabutton, 后台服务
+1
+2
+3
+4
+5
+2. 服务端实现:
+
+服务器采用freeswitch ver1.6.9, 主要改动集中在三部分：
+fs源代码的改动
+sofia_reg.c:
+禁止多点注册
+mod_conference.c:
+每3秒发一次静音包
+
+fs配置，主要包括(但不限于):
+sip_profiles/internal.xml:
+enable-timer=false
+enable-rfc-5626=true 
+dtmf-type=info 
+sip-expires-late-margin=1
+unregister-on-options-fail=false
+all-reg-options-ping=true
+ping-mean-interval=10
+registration-thread-frequency=60
+nat-options-ping=true
+tcp-keepalive=true
+disable-transcoding=true
+inbound-proxy-media=true
+ext-sip-ip=116.228.237.226
+ext-rtp-ip=116.228.237.226
+dialplan/default.xml:
+修改拨号计划匹配特定格式的用户名(字母、数字和下划线组合)例如test1, zhangsan_1, lisi5等
+autoload_cnofigs/switch.conf.xml中将数据库core.db放到事先建好的内存盘
+dialplan/目录增加新的拨号计划文件例如zhidui1.xml, leaders(增加新的组，可以通过更改directory/目录下用户配置文件来将特定用户配置到譬如zhidui1或者leaders这些组中)
+
+esl客户端的实现
+这部分是对讲系统的核心，对讲业务的逻辑实现都在这里，它定义了针对每个用户(=客户端，下同)的关键数据结构，然后通过hashmap总体管理所有用户譬如上下线状态，遍历查找特定用户，更改某用户状态等，这些都是通过事件驱动的，用户注册上线，进入会议，发起对讲等等都会使fs激发相应的事件，而esl客户端订阅了这些事件，收到这些事件后，进行解析然后得到期望的信息，然后去操作hashmap，具体的功能包括：
+用户注册上线检测
+用户下线检测
+处理用户的对讲请求(当前对讲权是否被占用，此对讲请求能否被允许，如果可以，开启此用户的对讲即取消静音状态)
+处理对讲完毕请求
+处理客户端获取在线用户列表的请求
+通过控制台将某用户静音或者踢掉或者..., 对hashmap进行同步处理
+会议室取消后处理
+备注：这里不得不提到一个教训，我的esl客户端直接基于fs的testclient.c写的，写到后面发现c语言处理大量的各种字符串操作真是噩梦，建议各位写一个完整功能的esl客户端尽量采用高级语言，例如java，python等，工作量和难度可以减少一个量级，bug也更少
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+3. 发布
+
+3.1 fs在centos上编译
+3.2 完成一个自动化脚本在centos上打包fs的部署所需要的文件和包
+1
+2
+关键问题：
+
+nat穿越:
+
+    linphone端: 因为sip服务器通过映射到公网，所以sip不存在nat问题，rtp的nat支持常用的几种方式:stun,turn,ice，考虑到耗时、复杂度等因素，目前在我们的方案中均没有开启这几种方式，而是增加了基本的udp打洞，目的是保证通过sdp交换获得对方的ip后，能够让对方的rtp流穿透我方的路由器(nat)-如果对方的rtp流先到的话(在点对点对讲时用到)
+    服务端:fs位于内网，通过端口映射暴露到公网，fs禁止了upnp和nat-pmp因为我们的路由器不支持此功能，服务器开启了rport功能帮助客户端发现自己的公网ip&port，另外fs开启了学习流功能，即在集群对讲模式下(fs的会议模式中)，所有的rtp流都要经过fs，当fs收到某个客户端的rtp流后，会探测其来源端口，如果此端口和之前sdp协商时候获得的客户端rtp端口不一致，则以此实际端口为准(sdp协商的rtp端口作废)。
+1
+2
+心跳:
+
+    服务器和客户端之间必须维持‘保活心跳’，两个目的：1.保持sip&rtp的udp端口不被nat干掉(‘长时间’没有udp包的端口很可能会被nat回收) 2.让服务器知道客户端的在线状态，linphone-android 3.9.1支持cn(comfortable noise)，但是有问题，所以我们禁止了这个功能，转而通过开启fs的option ping来保持sip心跳，通过发送间隔3秒的空rtp包来保持rtp心跳，同时通过options ping来检测客户端的在线状态
+1
+带宽
+
+    基于会议模式的对讲系统，没有采用混音(虽然是混音的框架，但是通过esl控制每个时刻只能有一个客户端讲话，这样就降低了服务器CPU的负荷也降低了带宽占用)
+1
+功耗
+
+    FS的会议模式，默认状态下即使客户端不讲话，fs也会按照sdp协商的ptime值发送空的rtp包，导致带宽占用和客户端wifi功耗、编解码功耗上升，不讲话时候fs改为3秒发送一次空rtp包会明显降低功耗
+1
+tcp vs udp：
+
+rtp只能基于udp，在voip的实现中，sip over udp和sip over tcp是两种选择，我们的项目里一开始也是采用默认的udp sip, 但是后来改为了tcp，主要是考虑到穿透性，此外tcp相对于udp还具有如下优势:
+udp keep alive timeout一般最多几十秒，而tcp keep alive timeout 要长很多，一般是几分钟起甚至十几分钟(路由对tcp port的保留优先级远高于udp port)，对于移动设备，其直接的好处就是功耗的降低，并且tcp有自己的keep-alive机制，不用再重新造轮子了:)
+在sip包大到一定程度(>=mtu-200)时候，rfc3261强制使用tcp-因为tcp本身具有分片功能-其好处就是一个分片丢失后可以重传恢复整个sip packet，而如果udp分包丢失，则整个sip包都要重传，导致效率低下。
+在我们的实践中，当时发现联通的4G无法拨通移动4G，后来改为sip ，over tcp就可以了，另外linphone-android 3.9.1对于tcp的支持有问题，表现为每次通话都重新bind一个tcp socket，然后通话过程中会发现监听的tcp port越来越多，修复了此bug后一切ok
